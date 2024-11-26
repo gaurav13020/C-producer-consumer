@@ -9,9 +9,13 @@
 #include <sys/shm.h>
 #include <semaphore.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <time.h>
 
 #define MAX_MESSAGE_LENGTH 1024
 #define SOCKET_PATH "/tmp/producer_consumer_socket"
+#define MAX_CONNECT_ATTEMPTS 10
+#define CONNECT_RETRY_DELAY 1  // seconds
 
 // Shared data structure for both socket and shared memory approaches
 typedef struct {
@@ -120,6 +124,7 @@ void parse_arguments(int argc, char* argv[], Arguments* args) {
 void producer_socket(Arguments* args) {
     int sock;
     struct sockaddr_un server;
+    int attempts = 0;
 
     // Create socket
     sock = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -132,15 +137,37 @@ void producer_socket(Arguments* args) {
     server.sun_family = AF_UNIX;
     strcpy(server.sun_path, SOCKET_PATH);
 
-    // Connect to the socket
-    if (connect(sock, (struct sockaddr*)&server, sizeof(struct sockaddr_un)) == -1) {
-        perror("connect");
+    // Try to connect with retries
+    while (attempts < MAX_CONNECT_ATTEMPTS) {
+        if (connect(sock, (struct sockaddr*)&server, sizeof(struct sockaddr_un)) == 0) {
+            // Successfully connected
+            break;
+        }
+
+        // Check if error is anything other than connection refused
+        if (errno != ECONNREFUSED) {
+            perror("connect");
+            close(sock);
+            exit(1);
+        }
+
+        // Connection refused, wait and retry
+        fprintf(stderr, "Connection attempt %d failed. Retrying...\n", attempts + 1);
+        sleep(CONNECT_RETRY_DELAY);
+        attempts++;
+    }
+
+    // Check if all connection attempts failed
+    if (attempts == MAX_CONNECT_ATTEMPTS) {
+        fprintf(stderr, "Failed to connect after %d attempts\n", MAX_CONNECT_ATTEMPTS);
+        close(sock);
         exit(1);
     }
 
     // Send message
     if (send(sock, args->message, strlen(args->message), 0) == -1) {
         perror("send");
+        close(sock);
         exit(1);
     }
 
@@ -174,12 +201,15 @@ void consumer_socket(Arguments* args) {
     // Bind socket
     if (bind(sock, (struct sockaddr*)&server, sizeof(struct sockaddr_un)) == -1) {
         perror("bind");
+        close(sock);
         exit(1);
     }
 
     // Listen for connections
     if (listen(sock, 1) == -1) {
         perror("listen");
+        close(sock);
+        unlink(SOCKET_PATH);
         exit(1);
     }
 
@@ -188,6 +218,8 @@ void consumer_socket(Arguments* args) {
     client_sock = accept(sock, (struct sockaddr*)&client, &client_len);
     if (client_sock == -1) {
         perror("accept");
+        close(sock);
+        unlink(SOCKET_PATH);
         exit(1);
     }
 
@@ -195,6 +227,9 @@ void consumer_socket(Arguments* args) {
     ssize_t received = recv(client_sock, buffer, sizeof(buffer), 0);
     if (received == -1) {
         perror("recv");
+        close(client_sock);
+        close(sock);
+        unlink(SOCKET_PATH);
         exit(1);
     }
     buffer[received] = '\0';
@@ -207,6 +242,8 @@ void consumer_socket(Arguments* args) {
     close(sock);
     unlink(SOCKET_PATH);
 }
+
+
 
 void producer_shared_memory(Arguments* args) {
     key_t key;
